@@ -243,6 +243,14 @@ class Win:
             return t[-1]
         return None
 
+    @property
+    def signpost(self) -> Optional[int]:
+        """Workspace number if this is one of the tutor's signpost windows."""
+        t = self.title
+        if t.startswith(TITLE_PREFIX + "ws") and t[len(TITLE_PREFIX) + 2:].isdigit():
+            return int(t[len(TITLE_PREFIX) + 2:])
+        return None
+
 
 class Snap:
     def __init__(self, h: Hypr, practice: int):
@@ -276,8 +284,23 @@ class Snap:
     def tile(self, letter) -> Optional[Win]:
         return self.tiles.get(letter)
 
+    @property
+    def signposts(self) -> dict:
+        return {c.signpost: c for c in self.clients if c.signpost}
+
     def strays(self) -> list:
-        return [c for c in self.clients if c.ws == self.practice and not c.letter and c.title != HUD_TITLE]
+        return [c for c in self.clients if c.ws == self.practice and not c.letter
+                and not c.signpost and c.title != HUD_TITLE]
+
+    def open_workspaces(self) -> list:
+        """Ids of the workspaces Super + Tab cycles through: the ones with windows on
+        the focused monitor, in order."""
+        mon = self.monitor.get("name")
+        ids = {w["id"] for w in self.workspaces.values()
+               if w.get("id", 0) > 0 and w.get("windows", 0) > 0 and (not mon or w.get("monitor") == mon)}
+        if self.aws and self.aws > 0:
+            ids.add(self.aws)
+        return sorted(ids)
 
     def layout(self, ws) -> str:
         return (self.workspaces.get(ws) or {}).get("tiledLayout", "dwindle")
@@ -491,9 +514,16 @@ def empty_ws(g, exclude) -> int:
     return random.choice(choices or [n for n in range(1, 10) if n not in exclude])
 
 
+def sandbox_ws(g, exclude=()) -> int:
+    """A signpost workspace to send the player to (never one of their own)."""
+    g.ensure_sandbox()
+    choices = [n for n in g.sandbox if n not in exclude]
+    return random.choice(choices) if choices else empty_ws(g, set(exclude) | {g.practice})
+
+
 def b_ws_switch(g, ctx):
     g.normalize()
-    n = other_ws(g, {g.practice, g.snap.aws})
+    n = sandbox_ws(g, {g.practice, g.snap.aws})
     return Step("Switch to workspace", f"Switch to workspace {n}",
                 f"Switch to workspace {n}", lambda s: s.aws == n)
 
@@ -507,16 +537,31 @@ def b_ws_back_number(g, ctx):
 def b_ws_former(g, ctx):
     p = g.practice
     if g.snap.aws == p:
-        g.dispatch(f'hl.dsp.focus({{ workspace = "{other_ws(g, {p})}" }})')
+        g.focus_ws(sandbox_ws(g, {p}))
+        g.settle()
     return Step("Former workspace", "Former workspace",
                 "Jump back to the workspace you were just on", lambda s: s.aws == p)
 
 
-def b_ws_cycle(desc, prompt):
+def b_ws_cycle(desc, prompt, step):
+    """Super + Tab walks the open workspaces, which may include the player's own.
+    Work out where the key will land and say so, so there are no surprises."""
     def build(g, ctx):
         g.normalize()
-        start = g.snap.aws
-        return Step(desc, desc, prompt, lambda s: s.aws != start and s.aws is not None and s.aws > 0)
+        g.ensure_sandbox()
+        if step < 0:
+            # Start on the signpost just above the tiles so "previous" comes home.
+            above = [n for n in g.sandbox if n > g.practice]
+            if above:
+                g.focus_ws(min(above))
+                g.settle()
+        s = g.poll()
+        order = s.open_workspaces()
+        if s.aws not in order or len(order) < 2:
+            raise Skip()
+        dest = order[(order.index(s.aws) + step) % len(order)]
+        where = "a signpost" if dest in g.sandbox else "the tiles" if dest == g.practice else "one of yours"
+        return Step(desc, desc, f"{prompt} — that's {dest}, {where}", lambda s: s.aws == dest)
     return build
 
 
@@ -525,7 +570,7 @@ def b_move_ws(follow):
         g.normalize()
         t = random.choice(list(g.snap.tiles.values()))
         g.focus(t.addr)
-        n = empty_ws(g, {g.practice})
+        n = sandbox_ws(g, {g.practice})
         ctx.update(tile=t.letter, addr=t.addr, ws=n)
         p = g.practice
         if follow:
@@ -750,8 +795,8 @@ EXERCISES = [
     # 3 · Workspaces
     ex("ws-switch", 3, "Switch to workspace", b_ws_switch, b_ws_back_number),
     ex("ws-former", 3, "Former workspace", b_ws_switch, b_ws_former),
-    ex("ws-next", 3, "Next workspace", b_ws_cycle("Next workspace", "Cycle to the next workspace"), b_ws_former),
-    ex("ws-prev", 3, "Previous workspace", b_ws_cycle("Previous workspace", "Cycle to the previous workspace"), b_ws_former),
+    ex("ws-next", 3, "Next workspace", b_ws_cycle("Next workspace", "Cycle to the next workspace", +1), b_ws_former),
+    ex("ws-prev", 3, "Previous workspace", b_ws_cycle("Previous workspace", "Cycle to the previous workspace", -1), b_ws_former),
     # 4 · Moving windows between workspaces
     ex("move-follow", 4, "Move window to workspace", b_move_ws(True), b_move_home),
     ex("move-silent", 4, "Move window silently to workspace", b_move_ws(False)),
@@ -812,7 +857,9 @@ LESSONS = {
         "workspace you just left, and Super + Tab / Super + Shift + Tab",
         "cycle through the ones that are open.",
         "",
-        "The tutor's panel is pinned, so it follows you around.",
+        "The tutor parks big numbered signposts on a couple of empty",
+        "workspaces. Those are where you'll be sent, so you never land in",
+        "your own apps. The panel is pinned, so it follows you around.",
     ]),
     4: ("Moving windows", [
         "Super + Shift + number sends the focused window to a workspace",
@@ -903,6 +950,8 @@ class Game:
         self.progress = load_progress()
         self.snap = Snap(self.h, practice)
         self.hud_addr = None
+        self.sandbox = []           # signpost workspaces claimed for workspace exercises
+        self.bottom_px = 0          # bottom gap in force while playing (0 = none)
         self.rows = 0
         self.row_px = 16.0          # terminal cell height in logical px; refined once the HUD is up
         self.play_h = 0
@@ -1059,6 +1108,31 @@ class Game:
         self.dispatch(f"hl.dsp.exec_cmd({lua_str(cmd)}, {{ workspace = \"{self.practice}\" }})")
         self.wait_for(lambda s: s.tile(letter) is not None, 6)
 
+    def ensure_sandbox(self, n=2):
+        """Claim n empty workspaces and park a signpost window on each, so workspace
+        exercises always have somewhere to go that isn't the player's own desktop."""
+        s = self.poll()
+        self.sandbox = [ws for ws in self.sandbox if ws in s.signposts]
+        if len(self.sandbox) >= n:
+            return
+        used = {c.ws for c in s.clients} | {self.practice, self.origin}
+        p = self.practice
+        order = [w for w in range(p + 1, 10)] + [w for w in range(1, p)]
+        for ws in order:
+            if len(self.sandbox) >= n:
+                break
+            if ws in used or ws in self.sandbox:
+                continue
+            cmd = terminal_cmd(f"{TITLE_PREFIX}ws{ws}", [sys.executable, SCRIPT, "--signpost", str(ws)])
+            self.dispatch(f"hl.dsp.exec_cmd({lua_str(cmd)}, {{ workspace = \"{ws}\" }})")
+            if self.wait_for(lambda s: ws in s.signposts, 6):
+                self.sandbox.append(ws)
+        if self.snap.aws != p:
+            self.focus_ws(p)
+        if self.bottom_px:
+            self.reserve_bottom(self.bottom_px)   # new workspaces need the strip gap too
+        self.write_tiles(self.tiles_state)        # signposts read the practice number from here
+
     def rebuild(self, n=3):
         for t in self.snap.tiles.values():
             self.win_dispatch("close", t.addr)
@@ -1138,11 +1212,15 @@ class Game:
             pass
         top, right, _, left = gaps
         self.release_bottom()
-        self.h.eval(f'omatutor_gap = hl.workspace_rule({{ workspace = "{self.practice}", '
-                    f'gaps_out = {{ top = {top}, right = {right}, bottom = {px}, left = {left} }} }})')
+        self.bottom_px = px
+        rules = ", ".join(f'hl.workspace_rule({{ workspace = "{ws}", gaps_out = {{ top = {top}, right = {right}, '
+                          f'bottom = {px}, left = {left} }} }})' for ws in [self.practice] + self.sandbox)
+        self.h.eval(f"omatutor_gaps = {{ {rules} }}")
 
     def release_bottom(self):
-        self.h.eval("if omatutor_gap then omatutor_gap:set_enabled(false); omatutor_gap = nil end")
+        self.bottom_px = 0
+        self.h.eval("if omatutor_gaps then for _, r in ipairs(omatutor_gaps) do r:set_enabled(false) end; "
+                    "omatutor_gaps = nil end")
 
     def cleanup(self):
         try:
@@ -1152,6 +1230,8 @@ class Game:
             for t in s.tiles.values():
                 self.win_dispatch("close", t.addr)
             for w in s.strays():
+                self.win_dispatch("close", w.addr)
+            for w in s.signposts.values():
                 self.win_dispatch("close", w.addr)
             if s.layout(self.practice) != "dwindle":
                 self.set_layout("dwindle")
@@ -1168,7 +1248,7 @@ class Game:
             pass
 
     def write_tiles(self, state: dict):
-        state = {**state, "hb": time.time(), "hud_pid": os.getpid()}
+        state = {**state, "hb": time.time(), "hud_pid": os.getpid(), "practice": self.practice}
         if state == self.tiles_state:
             return
         self.tiles_state = state
@@ -1566,9 +1646,14 @@ class Game:
             remaining = HINT_DELAY - (time.time() - t0)
             self.put(1, x, f"from memory… hint in {max(0, remaining):.0f}s", curses.A_DIM)
         kind, text = flash
+        aws = self.snap.aws
         if text:
             attr = {"ok": curses.color_pair(2) | curses.A_BOLD, "bad": curses.color_pair(3) | curses.A_BOLD}
             self.put(2, 3, text, attr.get(kind, curses.A_DIM))
+        elif aws and aws != self.practice:
+            what = "a tutor signpost" if aws in self.sandbox else "your own apps live here"
+            self.put(2, 3, f"You're on workspace {aws}, {what}.  Super + {self.practice} brings you back to the tiles.",
+                     curses.color_pair(4))
         elif step.note:
             self.put(2, 3, step.note, curses.A_DIM)
         footer = "in any tile:  Esc menu · h hint · s skip"
@@ -1651,10 +1736,22 @@ BIG = {
     "C": [" ████", "█    ", "█    ", "█    ", " ████"],
     "D": ["████ ", "█   █", "█   █", "█   █", "████ "],
 }
+DIGITS = {
+    "0": [" ███ ", "█   █", "█   █", "█   █", " ███ "],
+    "1": ["  █  ", " ██  ", "  █  ", "  █  ", " ███ "],
+    "2": [" ███ ", "█   █", "   █ ", "  █  ", "█████"],
+    "3": ["████ ", "    █", " ███ ", "    █", "████ "],
+    "4": ["█   █", "█   █", "█████", "    █", "    █"],
+    "5": ["█████", "█    ", "████ ", "    █", "████ "],
+    "6": [" ███ ", "█    ", "████ ", "█   █", " ███ "],
+    "7": ["█████", "    █", "   █ ", "  █  ", "  █  "],
+    "8": [" ███ ", "█   █", " ███ ", "█   █", " ███ "],
+    "9": [" ███ ", "█   █", " ████", "    █", " ███ "],
+}
 TILE_COLOR = {"A": curses.COLOR_RED, "B": curses.COLOR_GREEN, "C": curses.COLOR_BLUE, "D": curses.COLOR_MAGENTA}
 
 
-def tile_main(scr, letter):
+def tile_main(scr, letter, signpost=None):
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
@@ -1697,6 +1794,35 @@ def tile_main(scr, letter):
             return
 
         H, W = scr.getmaxyx()
+        if signpost is not None:
+            scr.erase()
+            glyph = [" ".join(DIGITS[d][i] for d in str(signpost)) for i in range(5)]
+            top = max(1, H // 2 - 5)
+            label = "WORKSPACE"
+            put(top - 1, (W - len(label)) // 2, label, curses.color_pair(1) | curses.A_BOLD)
+            for i, row in enumerate(glyph):
+                for j, ch in enumerate(row):
+                    if ch != " ":
+                        put(top + i, (W - len(row) * 2) // 2 + j * 2, "██", curses.color_pair(1) | curses.A_BOLD)
+            y = top + len(glyph) + 1
+            line = "tutor signpost · nothing of yours lives here"
+            put(y, (W - len(line)) // 2, line, curses.A_BOLD)
+            home = st.get("practice")
+            if home:
+                line = f"Super + {home} takes you back to the tiles"
+                put(y + 1, (W - len(line)) // 2, line, curses.A_DIM)
+            if st.get("phase") == "play" and H > 12:
+                prompt = st.get("prompt", "")
+                put(H - 3, max(1, (W - len(prompt)) // 2), prompt, curses.A_BOLD)
+            scr.refresh()
+            ch = scr.getch()
+            if ch == 27:
+                send("menu")
+            elif ch in (ord("s"), ord("S")):
+                send("skip")
+            elif ch in (ord("h"), ord("H")):
+                send("hint")
+            continue
         target = st.get("phase") == "play" and st.get("target") == letter
         active = st.get("active") == letter
         flash = st.get("flash")
@@ -1802,6 +1928,8 @@ def main():
     if "--tile" in argv:
         letter = argv[argv.index("--tile") + 1]
         curses.wrapper(tile_main, letter)
+    elif "--signpost" in argv:
+        curses.wrapper(tile_main, "", int(argv[argv.index("--signpost") + 1]))
     elif "--hud" in argv:
         hud(argv)
     elif "--reset" in argv:

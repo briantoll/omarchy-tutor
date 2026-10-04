@@ -40,6 +40,8 @@ It needs nothing beyond Python 3 and a terminal Omarchy already ships (foot, ala
 
 Each lesson has two rounds. First you do every move with the keys shown, then you do them all again, shuffled, from memory.
 
+The workspace lessons never send you into your own apps. Omatutor parks a big numbered signpost on two empty workspaces next to the practice one and only ever sends you there, and whenever you are away from the tiles the panel says where you are and which key brings you back. Super + Tab cycles through every open workspace, so for those prompts the panel also names the workspace the key will land on.
+
 When you get it right, the tile confirms it and the panel shows your time:
 
 ![A correct answer: the target tile turns green with a tick and the panel shows your time](screenshots/play-correct.png)
@@ -72,5 +74,6 @@ While you're playing, press **Esc** in any tile to go back to the menu, **h** fo
 ## Notes
 
 - Anything you open on the practice workspace during a session (e.g. a terminal from a stray Super + Enter) gets closed when the tiles are reset.
+- The signpost workspaces are claimed the first time a workspace exercise comes up and released when you quit.
 - If the layout lesson changes the practice workspace's layout, Omatutor restores Omarchy's saved layout file for that workspace when you quit.
 - Multi-monitor moves aren't drilled yet.
