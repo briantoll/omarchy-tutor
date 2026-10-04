@@ -1,0 +1,1686 @@
+#!/usr/bin/env python3
+"""Omatutor: a vimtutor-style game that drills Omarchy/Hyprland keybindings.
+
+It plays inside your real window manager. A small pinned HUD gives you an
+instruction, you press the real keys, and the tutor watches Hyprland's state
+(over its IPC socket) to see whether you did it. Practice windows are labelled
+tiles (A, B, C...) on a spare workspace, and everything is cleaned up on exit.
+
+  omatutor            launch the tutor (spawns its own HUD window)
+  omatutor drill      jump straight into the 5-minute drill
+  omatutor sprint     jump straight into the 60-second sprint
+  omatutor lesson N   jump straight into lesson N
+  omatutor --reset    forget all progress and stats
+"""
+
+import curses
+import json
+import locale
+import os
+import random
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+APP = "omatutor"
+TITLE_PREFIX = "omatutor:"
+HUD_TITLE = TITLE_PREFIX + "HUD"
+SCRIPT = os.path.realpath(__file__)
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), APP)
+PROGRESS_FILE = os.path.join(STATE_DIR, "progress.json")
+# Progress saved under the app's old name (omarchy-tutor) is picked up once and moved.
+OLD_STATE_DIR = os.path.join(os.path.dirname(STATE_DIR), "omarchy-tutor")
+TILE_STATE = os.path.join(RUNTIME, "tiles.json")
+CMD_FIFO = os.path.join(RUNTIME, "cmd")
+LAYOUTS_DIR = os.path.expanduser("~/.local/state/omarchy/workspace-layouts")
+
+LETTERS = "ABCD"
+HINT_DELAY = 4.0          # seconds before the key hint appears in drills
+DRILL_SECONDS = 300
+SPRINT_SECONDS = 60
+SETTLE = 0.12             # pause after our own dispatches
+
+
+# ─── Hyprland IPC ──────────────────────────────────────────────────────────
+
+class Hypr:
+    def __init__(self):
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if not sig:
+            sys.exit("omatutor must run inside a Hyprland session.")
+        self.sock = os.path.join(os.environ["XDG_RUNTIME_DIR"], "hypr", sig, ".socket.sock")
+
+    def _request(self, cmd: str) -> str:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(self.sock)
+            s.sendall(cmd.encode())
+            chunks = []
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+            return b"".join(chunks).decode(errors="replace")
+        finally:
+            s.close()
+
+    def query(self, what: str):
+        try:
+            return json.loads(self._request("j/" + what))
+        except (OSError, json.JSONDecodeError):
+            out = subprocess.run(["hyprctl", what, "-j"], capture_output=True, text=True).stdout
+            return json.loads(out or "null")
+
+    def dispatch(self, lua: str) -> str:
+        r = subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True)
+        return r.stdout.strip()
+
+    def eval(self, lua: str) -> str:
+        r = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True)
+        return r.stdout.strip()
+
+
+def lua_str(s: str) -> str:
+    return json.dumps(s)
+
+
+# ─── Keybinding lookup ─────────────────────────────────────────────────────
+
+# Fallbacks in case `omarchy-menu-keybindings --print` is unavailable.
+DEFAULT_KEYS = {
+    "Focus on left window": "SUPER + LEFT", "Focus on right window": "SUPER + RIGHT",
+    "Focus on above window": "SUPER + UP", "Focus on below window": "SUPER + DOWN",
+    "Focus on next window": "ALT + TAB",
+    "Swap window to the left": "SUPER SHIFT + LEFT", "Swap window to the right": "SUPER SHIFT + RIGHT",
+    "Swap window up": "SUPER SHIFT + UP", "Swap window down": "SUPER SHIFT + DOWN",
+    "Toggle window split": "SUPER + J",
+    "Expand window left": "SUPER + MINUS", "Shrink window left": "SUPER + EQUAL",
+    "Shrink window up": "SUPER SHIFT + MINUS", "Expand window down": "SUPER SHIFT + EQUAL",
+    "Former workspace": "SUPER CTRL + TAB", "Next workspace": "SUPER + TAB",
+    "Previous workspace": "SUPER SHIFT + TAB",
+    "Toggle window floating/tiling": "SUPER + T", "Full screen": "SUPER + F",
+    "Full width": "SUPER ALT + F", "Tiled full screen": "SUPER CTRL + F",
+    "Pop window out (float & pin)": "SUPER + O", "Close window": "SUPER + W",
+    "Terminal": "SUPER + RETURN", "Toggle workspace layout": "SUPER + L",
+    "Toggle window grouping": "SUPER + G", "Move active window out of group": "SUPER ALT + G",
+    "Move window to group on left": "SUPER ALT + LEFT", "Move window to group on right": "SUPER ALT + RIGHT",
+    "Move window to group on top": "SUPER ALT + UP", "Move window to group on bottom": "SUPER ALT + DOWN",
+    "Next window in group": "SUPER ALT + TAB",
+    "Toggle scratchpad": "SUPER + S", "Move window to scratchpad": "SUPER ALT + S",
+}
+for _n in range(1, 11):
+    _k = str(_n % 10)
+    DEFAULT_KEYS[f"Switch to workspace {_n}"] = f"SUPER + {_k}"
+    DEFAULT_KEYS[f"Move window to workspace {_n}"] = f"SUPER SHIFT + {_k}"
+    DEFAULT_KEYS[f"Move window silently to workspace {_n}"] = f"SUPER SHIFT ALT + {_k}"
+
+KEY_NAMES = {
+    "SUPER": "Super", "SHIFT": "Shift", "CTRL": "Ctrl", "ALT": "Alt", "RETURN": "Enter",
+    "LEFT": "←", "RIGHT": "→", "UP": "↑", "DOWN": "↓", "TAB": "Tab", "MINUS": "-",
+    "EQUAL": "=", "SPACE": "Space", "BACKSPACE": "Backspace", "ESCAPE": "Esc",
+}
+
+
+def load_keys() -> dict:
+    keys = dict(DEFAULT_KEYS)
+    if not shutil.which("omarchy-menu-keybindings"):
+        return keys
+    try:
+        out = subprocess.run(["omarchy-menu-keybindings", "--print"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return keys
+    seen = set()
+    for line in out.splitlines():
+        if "→" not in line:
+            continue
+        combo, desc = (p.strip() for p in line.split("→", 1))
+        if "mouse" in combo.lower() or desc in seen:
+            continue
+        seen.add(desc)
+        keys[desc] = combo
+    return keys
+
+
+def key_caps(combo: str) -> list:
+    """'SUPER SHIFT + 3' -> ['Super', 'Shift', '3']"""
+    mods, _, key = combo.rpartition("+")
+    parts = mods.split() + [key.strip()]
+    return [KEY_NAMES.get(p.upper(), p) for p in parts if p]
+
+
+# ─── State snapshot ────────────────────────────────────────────────────────
+
+@dataclass
+class Win:
+    raw: dict
+
+    @property
+    def addr(self): return self.raw["address"]
+    @property
+    def title(self): return self.raw.get("title", "")
+    @property
+    def ws(self): return self.raw["workspace"]["id"]
+    @property
+    def ws_name(self): return self.raw["workspace"]["name"]
+    @property
+    def floating(self): return self.raw.get("floating", False)
+    @property
+    def pinned(self): return self.raw.get("pinned", False)
+    @property
+    def fullscreen(self): return self.raw.get("fullscreen", 0)
+    @property
+    def fs_client(self): return self.raw.get("fullscreenClient", 0)
+    @property
+    def grouped(self): return self.raw.get("grouped", []) or []
+    @property
+    def hidden(self): return self.raw.get("hidden", False)
+    @property
+    def x(self): return self.raw["at"][0]
+    @property
+    def y(self): return self.raw["at"][1]
+    @property
+    def w(self): return self.raw["size"][0]
+    @property
+    def h(self): return self.raw["size"][1]
+    @property
+    def cx(self): return self.x + self.w / 2
+    @property
+    def cy(self): return self.y + self.h / 2
+
+    @property
+    def letter(self) -> Optional[str]:
+        t = self.title
+        if t.startswith(TITLE_PREFIX) and len(t) == len(TITLE_PREFIX) + 1:
+            return t[-1]
+        return None
+
+
+class Snap:
+    def __init__(self, h: Hypr, practice: int):
+        self.practice = practice
+        self.clients = [Win(c) for c in (h.query("clients") or []) if c.get("mapped", True)]
+        aw = h.query("activewindow") or {}
+        self.active_addr = aw.get("address")
+        self.aws = (h.query("activeworkspace") or {}).get("id")
+        mons = h.query("monitors") or []
+        self.monitors = mons
+        focused = next((m for m in mons if m.get("focused")), mons[0] if mons else {})
+        self.monitor = focused
+        self.special = (focused.get("specialWorkspace") or {}).get("name", "")
+        self.workspaces = {w["id"]: w for w in (h.query("workspaces") or [])}
+
+    def by_addr(self, addr) -> Optional[Win]:
+        return next((c for c in self.clients if c.addr == addr), None)
+
+    @property
+    def active(self) -> Optional[Win]:
+        return self.by_addr(self.active_addr)
+
+    @property
+    def hud(self) -> Optional[Win]:
+        return next((c for c in self.clients if c.title == HUD_TITLE), None)
+
+    @property
+    def tiles(self) -> dict:
+        return {c.letter: c for c in self.clients if c.letter}
+
+    def tile(self, letter) -> Optional[Win]:
+        return self.tiles.get(letter)
+
+    def strays(self) -> list:
+        return [c for c in self.clients if c.ws == self.practice and not c.letter and c.title != HUD_TITLE]
+
+    def layout(self, ws) -> str:
+        return (self.workspaces.get(ws) or {}).get("tiledLayout", "dwindle")
+
+    def tiled_on(self, ws) -> list:
+        return [c for c in self.clients
+                if c.ws == ws and not c.floating and not c.hidden and c.title != HUD_TITLE]
+
+    def fingerprint(self):
+        """Discrete state used to notice 'you did something, but not that'."""
+        wins = tuple(sorted((c.addr, c.ws, c.floating, c.fullscreen, c.fs_client, c.pinned,
+                             len(c.grouped)) for c in self.clients if c.title != HUD_TITLE))
+        return (self.active_addr, self.aws, self.special, self.layout(self.practice), wins)
+
+    def geometry(self):
+        return tuple(sorted((c.addr, c.x, c.y, c.w, c.h) for c in self.clients if c.letter))
+
+
+DIRS = "lrud"
+DIR_WORD = {"l": "LEFT ←", "r": "RIGHT →", "u": "UP ↑", "d": "DOWN ↓"}
+
+
+def in_dir(src: Win, dst: Win, d: str, tol=4) -> bool:
+    if d == "l": return dst.x + dst.w <= src.x + tol and overlap(src.y, src.h, dst.y, dst.h)
+    if d == "r": return dst.x >= src.x + src.w - tol and overlap(src.y, src.h, dst.y, dst.h)
+    if d == "u": return dst.y + dst.h <= src.y + tol and overlap(src.x, src.w, dst.x, dst.w)
+    return dst.y >= src.y + src.h - tol and overlap(src.x, src.w, dst.x, dst.w)
+
+
+def overlap(a, al, b, bl) -> bool:
+    return min(a + al, b + bl) - max(a, b) > 0
+
+
+def neighbor(snap: Snap, src: Win, d: str) -> Optional[Win]:
+    cands = [c for c in snap.tiled_on(src.ws) if c.addr != src.addr and in_dir(src, c, d)]
+    if not cands:
+        return None
+    return min(cands, key=lambda c: abs(c.cx - src.cx) + abs(c.cy - src.cy))
+
+
+def still_tiled(before: Win, after: Win) -> bool:
+    """Geometry checks only count while the window stays a plain tile on the same workspace."""
+    return (not after.floating and not after.fullscreen and not after.grouped
+            and after.ws == before.ws)
+
+
+def moved_dir(before: Win, after: Win, d: str, min_px=20) -> bool:
+    dx, dy = after.cx - before.cx, after.cy - before.cy
+    return {"l": -dx, "r": dx, "u": -dy, "d": dy}[d] >= min_px
+
+
+# ─── Terminal spawning ─────────────────────────────────────────────────────
+
+def terminal_cmd(title: str, argv: list) -> str:
+    """Build a shell command that opens `argv` in the user's terminal with a fixed title."""
+    preferred = []
+    try:
+        with open(os.path.expanduser("~/.config/xdg-terminals.list")) as f:
+            preferred = [l.strip().lower() for l in f if l.strip() and not l.startswith("#")]
+    except OSError:
+        pass
+    order = []
+    for entry in preferred:
+        for name in ("foot", "alacritty", "kitty", "ghostty"):
+            if name in entry and name not in order:
+                order.append(name)
+    order += [n for n in ("foot", "alacritty", "kitty", "ghostty") if n not in order]
+    term = next((n for n in order if shutil.which(n)), None)
+    if not term:
+        sys.exit("No supported terminal found (foot, alacritty, kitty or ghostty).")
+    q = " ".join(_shq(a) for a in argv)
+    t = _shq(title)
+    return {
+        "foot": f"foot --app-id={APP} --title={t} {q}",
+        "alacritty": f"alacritty --class {APP} --title {t} -e {q}",
+        "kitty": f"kitty --class {APP} --title {t} {q}",
+        "ghostty": f"ghostty --class=com.omarchy.tutor --title={t} -e {q}",
+    }[term]
+
+
+def _shq(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+# ─── Steps & exercises ─────────────────────────────────────────────────────
+
+@dataclass
+class Step:
+    skill: str                       # stats key
+    desc: str                        # binding description (for key lookup)
+    prompt: str
+    check: Callable[[Snap], bool]
+    target: Optional[str] = None     # tile letter to light up
+    note: str = ""
+
+
+@dataclass
+class Exercise:
+    id: str
+    lesson: int
+    skill: str
+    builders: list                   # [fn(game, ctx) -> Step]
+
+
+class Skip(Exception):
+    """Raised by a builder when the current layout can't host this exercise."""
+
+
+def pick_with_neighbor(g, d) -> tuple:
+    s = g.snap
+    options = [(t, neighbor(s, t, d)) for t in s.tiles.values()]
+    options = [(t, n) for t, n in options if n]
+    if not options:
+        g.rebuild()
+        s = g.snap
+        options = [(t, neighbor(s, t, d)) for t in s.tiles.values()]
+        options = [(t, n) for t, n in options if n]
+    if not options:
+        raise Skip()
+    return random.choice(options)
+
+
+def b_focus(d):
+    desc = {"l": "Focus on left window", "r": "Focus on right window",
+            "u": "Focus on above window", "d": "Focus on below window"}[d]
+
+    def build(g, ctx):
+        g.normalize()
+        src, dst = pick_with_neighbor(g, d)
+        g.focus(src.addr)
+        start = g.snap.by_addr(src.addr)
+
+        def check(s):
+            a = s.active
+            return bool(a and a.addr != start.addr and (a.addr == dst.addr or in_dir(start, a, d)))
+        return Step(desc, desc, f"Move focus {DIR_WORD[d]}", check, target=dst.letter)
+    return build
+
+
+def b_focus_next(g, ctx):
+    g.normalize()
+    start = g.snap.active_addr
+
+    def check(s):
+        a = s.active
+        return bool(a and a.addr != start and a.ws == g.practice)
+    return Step("Focus on next window", "Focus on next window",
+                "Cycle focus to the next window", check)
+
+
+def b_swap(d):
+    desc = {"l": "Swap window to the left", "r": "Swap window to the right",
+            "u": "Swap window up", "d": "Swap window down"}[d]
+
+    def build(g, ctx):
+        g.normalize()
+        src, _ = pick_with_neighbor(g, d)
+        g.focus(src.addr)
+        before = g.snap.by_addr(src.addr)
+
+        def check(s):
+            w = s.by_addr(before.addr)
+            return bool(w and s.active_addr == w.addr and still_tiled(before, w) and moved_dir(before, w, d))
+        return Step(desc, desc, f"Swap window {src.letter} {DIR_WORD[d]}", check, target=src.letter)
+    return build
+
+
+def b_split(g, ctx):
+    g.normalize()
+    t = random.choice(list(g.snap.tiles.values()))
+    g.focus(t.addr)
+    before = g.snap.by_addr(t.addr)
+
+    def check(s):
+        w = s.by_addr(before.addr)
+        return bool(w and still_tiled(before, w) and (abs(w.w - before.w) > 10 or abs(w.h - before.h) > 10))
+    return Step("Toggle window split", "Toggle window split",
+                f"Flip the split of window {t.letter} (side-by-side ⇄ stacked)", check, target=t.letter)
+
+
+def b_resize(desc, axis):
+    def build(g, ctx):
+        g.normalize()
+        need = "lr" if axis == "w" else "ud"
+        options = [t for t in g.snap.tiles.values() if any(neighbor(g.snap, t, d) for d in need)]
+        if not options:
+            g.rebuild()
+            options = [t for t in g.snap.tiles.values() if any(neighbor(g.snap, t, d) for d in need)]
+        if not options:
+            raise Skip()
+        t = random.choice(options)
+        g.focus(t.addr)
+        before = g.snap.by_addr(t.addr)
+
+        def check(s):
+            w = s.by_addr(before.addr)
+            if not w or not still_tiled(before, w):
+                return False
+            return abs((w.w - before.w) if axis == "w" else (w.h - before.h)) >= 10
+        return Step(desc, desc, f"{desc} (window {t.letter})", check, target=t.letter)
+    return build
+
+
+def other_ws(g, exclude) -> int:
+    return random.choice([n for n in range(1, 10) if n not in exclude])
+
+
+def empty_ws(g, exclude) -> int:
+    used = {c.ws for c in g.snap.clients}
+    choices = [n for n in range(1, 10) if n not in used and n not in exclude]
+    return random.choice(choices or [n for n in range(1, 10) if n not in exclude])
+
+
+def b_ws_switch(g, ctx):
+    g.normalize()
+    n = other_ws(g, {g.practice, g.snap.aws})
+    return Step("Switch to workspace", f"Switch to workspace {n}",
+                f"Switch to workspace {n}", lambda s: s.aws == n)
+
+
+def b_ws_back_number(g, ctx):
+    p = g.practice
+    return Step("Switch to workspace", f"Switch to workspace {p}",
+                f"Go back to workspace {p}", lambda s: s.aws == p)
+
+
+def b_ws_former(g, ctx):
+    p = g.practice
+    if g.snap.aws == p:
+        g.dispatch(f'hl.dsp.focus({{ workspace = "{other_ws(g, {p})}" }})')
+    return Step("Former workspace", "Former workspace",
+                "Jump back to the workspace you were just on", lambda s: s.aws == p)
+
+
+def b_ws_cycle(desc, prompt):
+    def build(g, ctx):
+        g.normalize()
+        start = g.snap.aws
+        return Step(desc, desc, prompt, lambda s: s.aws != start and s.aws is not None and s.aws > 0)
+    return build
+
+
+def b_move_ws(follow):
+    def build(g, ctx):
+        g.normalize()
+        t = random.choice(list(g.snap.tiles.values()))
+        g.focus(t.addr)
+        n = empty_ws(g, {g.practice})
+        ctx.update(tile=t.letter, addr=t.addr, ws=n)
+        p = g.practice
+        if follow:
+            desc, skill = f"Move window to workspace {n}", "Move window to workspace"
+            prompt = f"Send window {t.letter} to workspace {n} — and follow it"
+        else:
+            desc, skill = f"Move window silently to workspace {n}", "Move window silently to workspace"
+            prompt = f"Send window {t.letter} to workspace {n} silently (stay here)"
+
+        def check(s):
+            w = s.by_addr(t.addr)
+            return bool(w and w.ws == n and s.aws == (n if follow else p))
+        return Step(skill, desc, prompt, check, target=t.letter)
+    return build
+
+
+def b_move_home(g, ctx):
+    p, addr = g.practice, ctx["addr"]
+    w = g.snap.by_addr(addr)
+    if not w:
+        raise Skip()
+    if g.snap.active_addr != addr:
+        g.focus(addr)
+
+    def check(s):
+        x = s.by_addr(addr)
+        return bool(x and x.ws == p and s.aws == p)
+    return Step("Move window to workspace", f"Move window to workspace {p}",
+                f"Bring window {ctx['tile']} home: move it to workspace {p}", check, target=ctx["tile"])
+
+
+def b_mode(desc, on_prompt, off_prompt, pred):
+    """Two-step exercise: turn a window state on, then off again with the same key."""
+    def on(g, ctx):
+        g.normalize()
+        t = random.choice(list(g.snap.tiles.values()))
+        g.focus(t.addr)
+        ctx.update(addr=t.addr, tile=t.letter)
+
+        def check(s):
+            w = s.by_addr(t.addr)
+            return bool(w and pred(w))
+        return Step(desc, desc, on_prompt.format(t.letter), check, target=t.letter)
+
+    def off(g, ctx):
+        addr = ctx["addr"]
+        w = g.snap.by_addr(addr)
+        if not w or not pred(w):
+            raise Skip()
+        if g.snap.active_addr != addr:
+            g.focus(addr)
+
+        def check(s):
+            x = s.by_addr(addr)
+            return bool(x and not pred(x))
+        return Step(desc, desc, off_prompt.format(ctx["tile"]), check, target=ctx["tile"])
+    return [on, off]
+
+
+def b_close(g, ctx):
+    g.normalize()
+    t = random.choice(list(g.snap.tiles.values()))
+    g.focus(t.addr)
+    return Step("Close window", "Close window", f"Close window {t.letter}",
+                lambda s: s.by_addr(t.addr) is None, target=t.letter)
+
+
+def b_terminal(g, ctx):
+    g.normalize()
+
+    def check(s):
+        new = s.strays()
+        if new:
+            ctx["addr"] = new[0].addr
+            return True
+        return False
+    return Step("Terminal", "Terminal", "Open a new terminal", check)
+
+
+def b_close_new(g, ctx):
+    addr = ctx.get("addr")
+    if not addr or not g.snap.by_addr(addr):
+        raise Skip()
+    if g.snap.active_addr != addr:
+        g.focus(addr)
+    return Step("Close window", "Close window", "Close that terminal again",
+                lambda s: s.by_addr(addr) is None)
+
+
+def b_layout_on(g, ctx):
+    g.normalize()
+    p = g.practice
+    return Step("Toggle workspace layout", "Toggle workspace layout",
+                "Switch this workspace to the scrolling layout",
+                lambda s: s.layout(p) != "dwindle", note="Scrolling lays windows out as a horizontal strip of columns.")
+
+
+def b_layout_off(g, ctx):
+    p = g.practice
+    if g.snap.layout(p) == "dwindle":
+        raise Skip()
+    return Step("Toggle workspace layout", "Toggle workspace layout",
+                "Switch back to the dwindle (tiling) layout", lambda s: s.layout(p) == "dwindle")
+
+
+def make_group(g):
+    """Group two adjacent tiles. Returns (group_window_addr, member_addr)."""
+    d = random.choice(DIRS)
+    a, b = pick_with_neighbor(g, d)
+    g.focus(b.addr)
+    g.dispatch("hl.dsp.group.toggle()")
+    g.focus(a.addr)
+    g.dispatch(f'hl.dsp.window.move({{ into_group = "{d}" }})')
+    g.poll()
+    w = g.snap.by_addr(a.addr)
+    if not w or len(w.grouped) < 2:
+        raise Skip()
+    return a, b
+
+
+def b_group_toggle_on(g, ctx):
+    g.normalize()
+    t = random.choice(list(g.snap.tiles.values()))
+    g.focus(t.addr)
+    ctx.update(addr=t.addr, tile=t.letter)
+    return Step("Toggle window grouping", "Toggle window grouping",
+                f"Turn window {t.letter} into a group (tabbed container)",
+                lambda s: bool(s.by_addr(t.addr) and s.by_addr(t.addr).grouped), target=t.letter)
+
+
+def b_group_toggle_off(g, ctx):
+    addr = ctx["addr"]
+    w = g.snap.by_addr(addr)
+    if not w or not w.grouped:
+        raise Skip()
+    return Step("Toggle window grouping", "Toggle window grouping", "Dissolve that group again",
+                lambda s: bool(s.by_addr(addr) and not s.by_addr(addr).grouped), target=ctx["tile"])
+
+
+def b_group_join(d):
+    desc = {"l": "Move window to group on left", "r": "Move window to group on right",
+            "u": "Move window to group on top", "d": "Move window to group on bottom"}[d]
+
+    def build(g, ctx):
+        g.normalize()
+        member, grp = pick_with_neighbor(g, d)
+        g.focus(grp.addr)
+        g.dispatch("hl.dsp.group.toggle()")
+        g.focus(member.addr)
+
+        def check(s):
+            w = s.by_addr(member.addr)
+            return bool(w and (grp.addr in w.grouped or len(w.grouped) >= 2))
+        return Step(desc, desc, f"Move window {member.letter} into the group {DIR_WORD[d]}",
+                    check, target=grp.letter, note=f"Window {grp.letter} is already a group.")
+    return build
+
+
+def b_group_cycle(g, ctx):
+    g.normalize()
+    a, b = make_group(g)
+    start = g.snap.active_addr
+
+    def check(s):
+        x = s.active
+        return bool(x and x.addr != start and start in x.grouped)
+    return Step("Next window in group", "Next window in group",
+                "Flip to the next tab in this group", check)
+
+
+def b_group_leave(g, ctx):
+    g.normalize()
+    a, b = make_group(g)
+    start = g.snap.active_addr
+
+    def check(s):
+        w = s.by_addr(start)
+        return bool(w and not w.grouped)
+    return Step("Move active window out of group", "Move active window out of group",
+                "Pull this window out of its group", check)
+
+
+def b_scratch_send(g, ctx):
+    g.normalize()
+    t = random.choice(list(g.snap.tiles.values()))
+    g.focus(t.addr)
+    ctx.update(addr=t.addr, tile=t.letter)
+    return Step("Move window to scratchpad", "Move window to scratchpad",
+                f"Stash window {t.letter} in the scratchpad",
+                lambda s: bool(s.by_addr(t.addr) and s.by_addr(t.addr).ws_name.startswith("special")),
+                target=t.letter)
+
+
+def b_scratch_show(g, ctx):
+    w = g.snap.by_addr(ctx.get("addr"))
+    if not w or not w.ws_name.startswith("special"):
+        raise Skip()
+    return Step("Toggle scratchpad", "Toggle scratchpad", f"Pop the scratchpad open to see {ctx['tile']}",
+                lambda s: s.special.startswith("special"))
+
+
+def b_scratch_hide(g, ctx):
+    return Step("Toggle scratchpad", "Toggle scratchpad", "Hide the scratchpad again",
+                lambda s: not s.special)
+
+
+def ex(id, lesson, skill, *builders):
+    return Exercise(id, lesson, skill, list(builders))
+
+
+EXERCISES = [
+    # 1 · Focus
+    *[ex(f"focus-{d}", 1, "", b_focus(d)) for d in DIRS],
+    ex("focus-next", 1, "Focus on next window", b_focus_next),
+    # 2 · Arrange
+    *[ex(f"swap-{d}", 2, "", b_swap(d)) for d in DIRS],
+    ex("split", 2, "Toggle window split", b_split),
+    ex("resize-w", 2, "Expand window left", b_resize("Expand window left", "w")),
+    ex("resize-w2", 2, "Shrink window left", b_resize("Shrink window left", "w")),
+    ex("resize-h", 2, "Expand window down", b_resize("Expand window down", "h")),
+    ex("resize-h2", 2, "Shrink window up", b_resize("Shrink window up", "h")),
+    # 3 · Workspaces
+    ex("ws-switch", 3, "Switch to workspace", b_ws_switch, b_ws_back_number),
+    ex("ws-former", 3, "Former workspace", b_ws_switch, b_ws_former),
+    ex("ws-next", 3, "Next workspace", b_ws_cycle("Next workspace", "Cycle to the next workspace"), b_ws_former),
+    ex("ws-prev", 3, "Previous workspace", b_ws_cycle("Previous workspace", "Cycle to the previous workspace"), b_ws_former),
+    # 4 · Moving windows between workspaces
+    ex("move-follow", 4, "Move window to workspace", b_move_ws(True), b_move_home),
+    ex("move-silent", 4, "Move window silently to workspace", b_move_ws(False)),
+    # 5 · Window modes
+    ex("float", 5, "Toggle window floating/tiling",
+       *b_mode("Toggle window floating/tiling", "Make window {} float", "Tile window {} again",
+               lambda w: w.floating)),
+    ex("fullscreen", 5, "Full screen",
+       *b_mode("Full screen", "Make window {} full screen", "Leave full screen", lambda w: w.fullscreen == 2)),
+    ex("fullwidth", 5, "Full width",
+       *b_mode("Full width", "Maximize window {} (full width, keeps the bar)", "Restore it to its tile",
+               lambda w: w.fullscreen == 1)),
+    ex("popout", 5, "Pop window out (float & pin)",
+       *b_mode("Pop window out (float & pin)", "Pop window {} out (float & pin)", "Pop it back into the tiles",
+               lambda w: w.pinned)),
+    ex("close", 5, "Close window", b_close),
+    ex("terminal", 5, "Terminal", b_terminal, b_close_new),
+    # 6 · Layouts & groups
+    ex("layout", 6, "Toggle workspace layout", b_layout_on, b_layout_off),
+    ex("group", 6, "Toggle window grouping", b_group_toggle_on, b_group_toggle_off),
+    *[ex(f"group-join-{d}", 6, "", b_group_join(d)) for d in DIRS],
+    ex("group-cycle", 6, "Next window in group", b_group_cycle),
+    ex("group-leave", 6, "Move active window out of group", b_group_leave),
+    # 7 · Scratchpad
+    ex("scratch", 7, "Move window to scratchpad", b_scratch_send, b_scratch_show, b_scratch_hide),
+]
+# Direction-based exercises take their stats key from the binding they drill.
+for _e in EXERCISES:
+    if not _e.skill:
+        kind, d = _e.id.rsplit("-", 1)
+        _e.skill = {
+            "focus": {"l": "Focus on left window", "r": "Focus on right window",
+                      "u": "Focus on above window", "d": "Focus on below window"},
+            "swap": {"l": "Swap window to the left", "r": "Swap window to the right",
+                     "u": "Swap window up", "d": "Swap window down"},
+            "group-join": {"l": "Move window to group on left", "r": "Move window to group on right",
+                           "u": "Move window to group on top", "d": "Move window to group on bottom"},
+        }[kind][d]
+
+LESSONS = {
+    1: ("Focus", [
+        "Omarchy is a tiling window manager: windows never overlap, they",
+        "share the screen. Almost everything starts with the Super key.",
+        "",
+        "Super + arrow moves focus between tiles. The lit tile shows where",
+        "focus should land. Alt + Tab also cycles through windows.",
+    ]),
+    2: ("Arrange", [
+        "Add Shift to the focus keys and the window itself moves:",
+        "Super + Shift + arrow swaps it with its neighbour.",
+        "",
+        "Super + J flips a split between side-by-side and stacked.",
+        "Super + - and Super + = resize; add Shift for the other axis.",
+    ]),
+    3: ("Workspaces", [
+        "Workspaces are separate desktops, numbered 1–10.",
+        "Super + number jumps to one. Super + Ctrl + Tab returns to the",
+        "workspace you just left, and Super + Tab / Super + Shift + Tab",
+        "cycle through the ones that are open.",
+        "",
+        "The tutor's panel is pinned, so it follows you around.",
+    ]),
+    4: ("Moving windows", [
+        "Super + Shift + number sends the focused window to a workspace",
+        "and follows it there. Add Alt to send it silently, so you stay",
+        "where you are.",
+    ]),
+    5: ("Window modes", [
+        "Super + T floats a window, Super + F makes it full screen,",
+        "Super + Alt + F maximizes it but keeps the top bar, and",
+        "Super + O pops it out as a floating, pinned window.",
+        "Each key toggles, so press it again to undo.",
+        "",
+        "Super + Enter opens a terminal and Super + W closes a window.",
+    ]),
+    6: ("Layouts & groups", [
+        "Super + L toggles the workspace between dwindle (the default",
+        "tiling) and scrolling (a horizontal strip of columns).",
+        "",
+        "Super + G turns a window into a group: several windows stacked",
+        "as tabs in one tile. Super + Alt + arrow pulls a window into a",
+        "neighbouring group, Super + Alt + Tab flips tabs, and",
+        "Super + Alt + G pulls a window back out.",
+    ]),
+    7: ("Scratchpad", [
+        "The scratchpad is a hidden workspace that drops down over",
+        "whatever you're doing. Super + Alt + S stashes a window there",
+        "and Super + S shows or hides it.",
+    ]),
+}
+
+
+# ─── Progress / stats ──────────────────────────────────────────────────────
+
+def load_progress() -> dict:
+    if not os.path.exists(STATE_DIR) and os.path.isdir(OLD_STATE_DIR):
+        try:
+            os.rename(OLD_STATE_DIR, STATE_DIR)
+        except OSError:
+            pass
+    try:
+        with open(PROGRESS_FILE) as f:
+            p = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        p = {}
+    p.setdefault("lessons", [])
+    p.setdefault("skills", {})
+    p.setdefault("best", {})
+    p.setdefault("history", [])
+    return p
+
+
+def save_progress(p: dict):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = PROGRESS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(p, f, indent=1)
+    os.replace(tmp, PROGRESS_FILE)
+
+
+def record_skill(p: dict, skill: str, secs: float, clean: bool):
+    s = p["skills"].setdefault(skill, {"n": 0, "clean": 0, "avg": None, "best": None, "box": 0})
+    s["n"] += 1
+    s["clean"] += int(clean)
+    s["avg"] = secs if s["avg"] is None else round(0.7 * s["avg"] + 0.3 * secs, 3)
+    s["best"] = secs if s["best"] is None else min(s["best"], secs)
+    if clean and secs < 3:
+        s["box"] = min(5, s["box"] + 1)
+    elif not clean or secs > 8:
+        s["box"] = max(0, s["box"] - 1)
+
+
+def skill_weight(p: dict, skill: str) -> float:
+    s = p["skills"].get(skill)
+    if not s:
+        return 6.0
+    return (6 - s["box"]) * (1 + min(s["avg"] or 0, 10) / 4)
+
+
+# ─── The game ──────────────────────────────────────────────────────────────
+
+class Game:
+    def __init__(self, scr, practice: int, origin: int):
+        self.scr = scr
+        self.h = Hypr()
+        self.practice = practice
+        self.origin = origin
+        self.keys = load_keys()
+        self.progress = load_progress()
+        self.snap = Snap(self.h, practice)
+        self.hud_addr = None
+        self.focusable = True
+        self.tiles_state = {}
+        self.layout_file = os.path.join(LAYOUTS_DIR, f"{practice}.lua")
+        try:
+            with open(self.layout_file) as f:
+                self.layout_backup = f.read()
+        except OSError:
+            self.layout_backup = None
+        os.makedirs(RUNTIME, exist_ok=True)
+        if os.path.exists(CMD_FIFO):
+            os.unlink(CMD_FIFO)
+        os.mkfifo(CMD_FIFO)
+        self.fifo = os.open(CMD_FIFO, os.O_RDONLY | os.O_NONBLOCK)
+        self._fifo_keepalive = os.open(CMD_FIFO, os.O_WRONLY | os.O_NONBLOCK)
+        self.write_tiles({"phase": "menu"})
+        self.init_colors()
+
+    # ── hyprland helpers ──
+    def poll(self) -> Snap:
+        self.snap = Snap(self.h, self.practice)
+        return self.snap
+
+    def dispatch(self, lua: str):
+        self.h.dispatch(lua)
+
+    def settle(self, secs=SETTLE):
+        time.sleep(secs)
+        self.poll()
+
+    def focus(self, addr):
+        self.dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
+        self.settle()
+
+    def focus_ws(self, n):
+        self.dispatch(f'hl.dsp.focus({{ workspace = "{n}" }})')
+
+    def win_dispatch(self, fn: str, addr: str, extra: str = ""):
+        args = f'window = "address:{addr}"' + (", " + extra if extra else "")
+        self.dispatch(f"hl.dsp.window.{fn}({{ {args} }})")
+
+    def wait_for(self, pred, timeout=4.0) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if pred(self.poll()):
+                return True
+            time.sleep(0.05)
+        return False
+
+    # ── HUD window ──
+    def setup_hud(self):
+        if not self.wait_for(lambda s: s.hud is not None, 6):
+            return
+        self.hud_addr = self.snap.hud.addr
+        self.place_hud("menu")
+
+    def place_hud(self, mode: str):
+        if not self.hud_addr:
+            return
+        m = self.snap.monitor
+        scale = m.get("scale", 1) or 1
+        mw, mh = int(m.get("width", 1920) / scale), int(m.get("height", 1080) / scale)
+        mx, my = m.get("x", 0), m.get("y", 0)
+        if mode == "menu":
+            w, h = min(760, mw - 40), min(500, mh - 80)
+            x, y = mx + (mw - w) // 2, my + (mh - h) // 2
+        else:
+            w, h = min(820, mw - 40), 230
+            x, y = mx + (mw - w) // 2, my + mh - h - 18
+        hud = self.snap.hud
+        a = self.hud_addr
+        if hud and not hud.floating:
+            self.win_dispatch("float", a, 'action = "enable"')
+        self.win_dispatch("resize", a, f"x = {w}, y = {h}")
+        self.win_dispatch("move", a, f"x = {x}, y = {y}")
+        if hud and not hud.pinned:
+            self.win_dispatch("pin", a)
+        self.win_dispatch("set_prop", a, 'prop = "opaque", value = "1"')
+        self.dispatch(f'hl.dsp.window.alter_zorder({{ window = "address:{a}", mode = "top" }})')
+        self.settle()
+        self.sync_size()
+
+    def sync_size(self):
+        """Pick up the HUD's new terminal size right away instead of on the next getch."""
+        for _ in range(10):
+            try:
+                cols, rows = os.get_terminal_size(sys.__stdout__.fileno())
+            except OSError:
+                return
+            if curses.is_term_resized(rows, cols):
+                curses.resizeterm(rows, cols)
+                self.scr.clear()
+                return
+            time.sleep(0.05)
+
+    def hud_focusable(self, yes: bool):
+        if not self.hud_addr or self.focusable == yes:
+            return
+        self.win_dispatch("set_prop", self.hud_addr, f'prop = "no_focus", value = "{0 if yes else 1}"')
+        self.focusable = yes
+        if yes:
+            self.focus(self.hud_addr)
+
+    # ── practice tiles ──
+    def spawn_tile(self, letter):
+        cmd = terminal_cmd(TITLE_PREFIX + letter, [sys.executable, SCRIPT, "--tile", letter])
+        self.dispatch(f"hl.dsp.exec_cmd({lua_str(cmd)}, {{ workspace = \"{self.practice}\" }})")
+        self.wait_for(lambda s: s.tile(letter) is not None, 6)
+
+    def rebuild(self, n=3):
+        for t in self.snap.tiles.values():
+            self.win_dispatch("close", t.addr)
+        self.wait_for(lambda s: not s.tiles, 4)
+        self.normalize(n)
+
+    def normalize(self, n=3):
+        """Put the sandbox back into a known state: n plain tiles on the practice workspace."""
+        s = self.poll()
+        p = self.practice
+        changed = False
+        if s.special:
+            self.dispatch(f'hl.dsp.workspace.toggle_special({lua_str(s.special.replace("special:", ""))})')
+            changed = True
+        if s.aws != p:
+            self.focus_ws(p)
+            changed = True
+        for w in s.strays():
+            self.win_dispatch("close", w.addr)
+            changed = True
+        for _ in range(4):
+            grouped = next((t for t in self.poll().tiles.values() if t.grouped), None)
+            if not grouped:
+                break
+            self.focus(grouped.addr)
+            self.dispatch("hl.dsp.group.toggle()")
+            self.settle()
+            changed = True
+        s = self.snap
+        for t in s.tiles.values():
+            a = t.addr
+            if t.fullscreen or t.fs_client:
+                self.win_dispatch("fullscreen_state", a, "internal = 0, client = 0")
+                changed = True
+            if t.pinned:
+                self.win_dispatch("pin", a)
+                changed = True
+            if t.floating:
+                self.win_dispatch("float", a, 'action = "disable"')
+                changed = True
+            if t.ws != p:
+                self.win_dispatch("move", a, f'workspace = "{p}", follow = false')
+                changed = True
+        if changed:
+            self.settle(0.2)
+        if self.poll().layout(p) != "dwindle":
+            self.set_layout("dwindle")
+            self.settle(0.2)
+        letters = LETTERS[:n]
+        for t in list(self.snap.tiles.values()):
+            if t.letter not in letters:
+                self.win_dispatch("close", t.addr)
+        for letter in letters:
+            if not self.snap.tile(letter):
+                self.focus_ws(p)
+                self.spawn_tile(letter)
+        if self.snap.aws != p:
+            self.focus_ws(p)
+        self.settle()
+        tiles = list(self.snap.tiles.values())
+        if tiles and (not self.snap.active or not self.snap.active.letter):
+            self.focus(random.choice(tiles).addr)
+
+    def set_layout(self, layout):
+        self.h.eval(f'hl.workspace_rule({{ workspace = "{self.practice}", layout = "{layout}" }})')
+
+    def cleanup(self):
+        try:
+            s = self.poll()
+            if s.special:
+                self.dispatch(f'hl.dsp.workspace.toggle_special({lua_str(s.special.replace("special:", ""))})')
+            for t in s.tiles.values():
+                self.win_dispatch("close", t.addr)
+            for w in s.strays():
+                self.win_dispatch("close", w.addr)
+            if s.layout(self.practice) != "dwindle":
+                self.set_layout("dwindle")
+            if self.layout_backup is None:
+                if os.path.exists(self.layout_file):
+                    os.unlink(self.layout_file)
+            else:
+                with open(self.layout_file, "w") as f:
+                    f.write(self.layout_backup)
+            self.write_tiles({"phase": "quit"})
+            self.focus_ws(self.origin)
+        except Exception:
+            pass
+
+    def write_tiles(self, state: dict):
+        state = {**state, "hb": time.time(), "hud_pid": os.getpid()}
+        if state == self.tiles_state:
+            return
+        self.tiles_state = state
+        tmp = TILE_STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, TILE_STATE)
+
+    def read_cmds(self) -> list:
+        try:
+            data = os.read(self.fifo, 4096).decode()
+        except BlockingIOError:
+            return []
+        return [c for c in data.split() if c]
+
+    # ── drawing ──
+    def init_colors(self):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.curs_set(0)
+        pairs = [(1, curses.COLOR_CYAN), (2, curses.COLOR_GREEN), (3, curses.COLOR_RED),
+                 (4, curses.COLOR_YELLOW), (5, curses.COLOR_MAGENTA), (6, curses.COLOR_BLUE)]
+        for i, c in pairs:
+            curses.init_pair(i, c, -1)
+        curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_CYAN)
+
+    def size(self):
+        """Usable rows/cols inside the panel's frame."""
+        H, W = self.scr.getmaxyx()
+        return max(0, H - 2), max(0, W - 2)
+
+    def put(self, y, x, text, attr=0):
+        H, W = self.size()
+        if y < 0 or y >= H or x >= W:
+            return
+        try:
+            self.scr.addnstr(y + 1, x + 1, text, max(0, W - x - 1), attr)
+        except curses.error:
+            pass
+
+    def frame(self):
+        """A solid accent-coloured frame so the floating panel reads as a panel on any
+        theme, including light ones where Hyprland's inactive border all but vanishes."""
+        attr = curses.color_pair(1) | curses.A_BOLD
+        try:
+            self.scr.attron(attr)
+            self.scr.box()
+            self.scr.attroff(attr)
+        except curses.error:
+            pass
+
+    def draw_caps(self, y, x, caps):
+        for i, cap in enumerate(caps):
+            if i:
+                self.put(y, x, " + ", curses.A_DIM)
+                x += 3
+            self.put(y, x, f" {cap} ", curses.color_pair(7) | curses.A_BOLD)
+            x += len(cap) + 2
+        return x
+
+    def caps_for(self, desc) -> list:
+        combo = self.keys.get(desc)
+        return key_caps(combo) if combo else ["?"]
+
+    def header(self, title, right=""):
+        self.frame()
+        H, W = self.size()
+        self.put(0, 1, " OMATUTOR ", curses.color_pair(8) | curses.A_BOLD)
+        self.put(0, 12, title, curses.color_pair(1) | curses.A_BOLD)
+        if right:
+            self.put(0, max(13 + len(title), W - len(right) - 2), right, curses.A_BOLD)
+        self.put(1, 1, "─" * (W - 3), curses.A_DIM)
+
+    # ── menus ──
+    def menu(self) -> Optional[tuple]:
+        self.place_hud("menu")
+        self.hud_focusable(True)
+        self.write_tiles({"phase": "menu"})
+        self.scr.nodelay(False)
+        self.scr.timeout(500)
+        done = set(self.progress["lessons"])
+        while True:
+            self.scr.erase()
+            self.header("muscle memory for your window manager")
+            y = 3
+            self.put(y, 3, "LESSONS", curses.A_BOLD)
+            y += 1
+            for n, (name, _) in LESSONS.items():
+                mark = "✓" if n in done else "·"
+                attr = curses.color_pair(2) if n in done else 0
+                self.put(y, 4, f"{n}  {name:<20}", attr)
+                self.put(y, 30, mark, attr | curses.A_BOLD)
+                y += 1
+            y += 1
+            self.put(y, 3, "DRILLS", curses.A_BOLD)
+            y += 1
+            best = self.progress["best"]
+            pool_note = f"lessons {self.drill_lessons_label()}"
+            for k, label, mode in (("d", "5-minute drill", "drill"), ("s", "60-second sprint", "sprint")):
+                self.put(y, 4, f"{k}  {label:<20}", curses.color_pair(1))
+                self.put(y, 30, f"best {best.get(mode, 0):>5}   ({pool_note})", curses.A_DIM)
+                y += 1
+            self.put(y, 4, "a  drill everything", curses.color_pair(1))
+            y += 1
+            self.put(y, 4, "k  your slowest keys")
+            y += 1
+            self.put(y, 4, "q  quit")
+            y += 2
+            self.put(y, 3, "Press a number or letter.  During play: Esc in any tile returns here.", curses.A_DIM)
+            self.scr.refresh()
+            self.write_tiles({"phase": "menu"})
+            ch = self.scr.getch()
+            if ch == -1:
+                continue
+            c = chr(ch) if 0 <= ch < 256 else ""
+            if c.isdigit() and int(c) in LESSONS:
+                return ("lesson", int(c))
+            if c == "d":
+                return ("drill", None)
+            if c == "s":
+                return ("sprint", None)
+            if c == "a":
+                return ("all", None)
+            if c == "k":
+                self.show_stats()
+            if c == "q":
+                return None
+
+    def drill_lessons(self) -> set:
+        done = set(self.progress["lessons"])
+        return done | {1, 2, 3} if len(done) < 3 else done
+
+    def drill_lessons_label(self) -> str:
+        ls = sorted(self.drill_lessons())
+        return ",".join(map(str, ls))
+
+    def show_stats(self):
+        skills = self.progress["skills"]
+        rows = sorted(skills.items(), key=lambda kv: -(kv[1]["avg"] or 0))
+        self.scr.erase()
+        self.header("your slowest keys")
+        if not rows:
+            self.put(3, 3, "No data yet. Play a lesson or a drill first.")
+        y = 3
+        for skill, s in rows[:14]:
+            desc = skill if skill in self.keys else next((d for d in self.keys if d.startswith(skill)), skill)
+            self.put(y, 3, f"{s['avg']:5.1f}s  ", curses.color_pair(4) if s["avg"] > 3 else curses.color_pair(2))
+            self.put(y, 12, f"{skill[:34]:<34}")
+            self.draw_caps(y, 48, self.caps_for(desc))
+            y += 1
+        self.put(y + 1, 3, "any key to go back", curses.A_DIM)
+        self.scr.refresh()
+        self.scr.timeout(-1)
+        self.scr.getch()
+        self.scr.timeout(500)
+
+    def intro(self, lesson) -> bool:
+        name, text = LESSONS[lesson]
+        self.scr.erase()
+        self.header(f"Lesson {lesson}: {name}")
+        for i, line in enumerate(text):
+            self.put(3 + i, 3, line)
+        y = 4 + len(text)
+        self.put(y, 3, "First you'll do each move with the keys shown, then again from memory.", curses.A_DIM)
+        self.put(y + 1, 3, "Take your hands off the mouse. The lit tile is your target.", curses.A_DIM)
+        self.put(y + 3, 3, "Enter: start    Esc: back", curses.color_pair(1) | curses.A_BOLD)
+        self.scr.refresh()
+        self.scr.timeout(-1)
+        while True:
+            ch = self.scr.getch()
+            if ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+                self.scr.timeout(500)
+                return True
+            if ch in (27, ord("q")):
+                self.scr.timeout(500)
+                return False
+
+    # ── play ──
+    def play(self, mode, lesson=None):
+        if mode == "lesson":
+            if not self.intro(lesson):
+                return
+            exs = [e for e in EXERCISES if e.lesson == lesson]
+            recall = exs[:]
+            random.shuffle(recall)
+            plan = [(e, True) for e in exs] + [(e, False) for e in recall]
+            duration = None
+            title = f"Lesson {lesson}: {LESSONS[lesson][0]}"
+        else:
+            pool_lessons = set(LESSONS) if mode == "all" else self.drill_lessons()
+            pool = [e for e in EXERCISES if e.lesson in pool_lessons]
+            plan = None
+            duration = SPRINT_SECONDS if mode == "sprint" else DRILL_SECONDS
+            title = {"drill": "5-minute drill", "sprint": "60-second sprint", "all": "drill: everything"}[mode]
+
+        self.scr.erase()
+        self.header(title)
+        self.put(3, 3, "Setting up the practice tiles…", curses.A_DIM)
+        self.scr.refresh()
+        self.place_hud("play")
+        self.hud_focusable(False)
+        self.normalize()
+        self.read_cmds()  # drop stray Esc presses from the menu
+
+        run = {"score": 0, "combo": 0, "steps": 0, "clean": 0, "times": [], "log": []}
+        t_start = time.time()
+        aborted = False
+        i = 0
+        last = None
+        retried = set()
+        while True:
+            if plan is not None:
+                if i >= len(plan):
+                    break
+                exercise, show_keys = plan[i]
+                i += 1
+            else:
+                if time.time() - t_start >= duration:
+                    break
+                choices = [e for e in pool if e.id != last] or pool
+                weights = [skill_weight(self.progress, e.skill) for e in choices]
+                exercise = random.choices(choices, weights)[0]
+                last = exercise.id
+                show_keys = False
+            ctx = {}
+            for n, build in enumerate(exercise.builders):
+                try:
+                    step = build(self, ctx)
+                except Skip:
+                    break
+                deadline = (t_start + duration) if duration else None
+                result = self.run_step(step, show_keys, title, run, deadline, mode != "lesson")
+                if result == "menu":
+                    aborted = True
+                    break
+                if result == "reset":
+                    self.flash_message("↺ Resetting the tiles — let's try a fresh one")
+                    if plan is not None and exercise.id not in retried:
+                        retried.add(exercise.id)
+                        i -= 1
+                    break
+                if result == "dirty":
+                    # The step passed, but a wrong action along the way may have left
+                    # the sandbox in an unknown state (a window floated, moved to
+                    # another workspace, grouped...). Put it back before going on.
+                    if n + 1 < len(exercise.builders):
+                        # The later steps assume a clean result from this one, so
+                        # start this exercise over rather than build on the mess.
+                        self.flash_message("↺ Tidying up the tiles — let's take that from the top")
+                        self.normalize()
+                        self.read_cmds()
+                        if plan is not None and exercise.id not in retried:
+                            retried.add(exercise.id)
+                            i -= 1
+                        break
+                    self.normalize()
+                    continue
+                if result in ("skip", "timeout"):
+                    break
+            if aborted:
+                break
+        self.normalize()
+        self.finish(mode, lesson, run, aborted, title)
+
+    def run_step(self, step: Step, show_keys, title, run, deadline, scored) -> str:
+        """Returns "ok", "dirty" (passed, but a wrong action was made along the way),
+        "reset", "skip", "timeout" or "menu"."""
+        self.poll()
+        t0 = time.time()
+        fp = self.snap.fingerprint()
+        pending = None
+        mistakes = 0
+        hinted = show_keys
+        flash = ("", 0)
+        while True:
+            now = time.time()
+            for cmd in self.read_cmds():
+                if cmd == "menu":
+                    return "menu"
+                if cmd == "skip":
+                    record_skill(self.progress, step.skill, max(now - t0, 10), False)
+                    run["combo"] = 0
+                    return "skip"
+                if cmd == "hint":
+                    hinted = True
+            if deadline and now >= deadline:
+                return "timeout"
+            s = self.poll()
+            if step.check(s):
+                secs = now - t0
+                clean = not hinted or show_keys
+                clean = clean and mistakes == 0
+                pts = 0
+                if scored:
+                    pts = 100 + max(0, int(200 * (1 - secs / 5)))
+                    if hinted:
+                        pts //= 2
+                    pts = max(10, pts - 25 * mistakes)
+                    run["combo"] = run["combo"] + 1 if clean else 0
+                    pts = int(pts * min(2.0, 1 + 0.1 * run["combo"]))
+                    run["score"] += pts
+                if not show_keys:
+                    record_skill(self.progress, step.skill, secs, clean and not hinted)
+                run["steps"] += 1
+                run["clean"] += int(clean and not hinted)
+                run["times"].append(secs)
+                run["log"].append((step.skill, step.desc, secs, hinted or show_keys))
+                self.draw_play(step, title, run, deadline, hinted, ("ok", f"✓ {secs:.2f}s" +
+                               (f"  +{pts}" if scored else "")), t0)
+                self.write_tiles(self.tile_payload(step, s, "ok", hinted))
+                time.sleep(0.45)
+                return "dirty" if mistakes else "ok"
+            nfp = s.fingerprint()
+            if nfp != fp:
+                if pending is None or pending[0] != nfp:
+                    pending = (nfp, now)
+                elif now - pending[1] > 0.3:
+                    mistakes += 1
+                    fp = nfp
+                    pending = None
+                    hinted = True
+                    flash = ("bad", now)
+            if mistakes >= 4 or (mistakes and now - flash[1] > 8):
+                record_skill(self.progress, step.skill, max(now - t0, 10), False)
+                run["combo"] = 0
+                return "reset"
+            if not hinted and now - t0 > HINT_DELAY:
+                hinted = True
+            if flash[0] and now - flash[1] < 1.5:
+                fl = ("bad", "✗ not quite — the keys are shown above")
+            elif mistakes:
+                fl = ("", "undo with the same key, or press s in a tile to skip")
+            else:
+                fl = ("", "")
+            self.draw_play(step, title, run, deadline, hinted, fl, t0)
+            self.write_tiles(self.tile_payload(step, s, fl[0], hinted))
+            time.sleep(0.04)
+
+    def flash_message(self, text):
+        self.scr.erase()
+        self.header("")
+        self.put(3, 5, text, curses.color_pair(4) | curses.A_BOLD)
+        self.scr.refresh()
+        time.sleep(0.8)
+
+    def tile_payload(self, step, s, flash, hinted):
+        a = s.active
+        return {"phase": "play", "prompt": step.prompt, "desc": step.desc,
+                "keys": " + ".join(self.caps_for(step.desc)) if hinted else "",
+                "target": step.target, "active": a.letter if a else None, "flash": flash}
+
+    def draw_play(self, step, title, run, deadline, hinted, flash, t0):
+        self.scr.erase()
+        right = f"score {run['score']}"
+        if run["combo"] > 1:
+            right += f"  ×{min(2.0, 1 + 0.1 * run['combo']):.1f}"
+        if deadline:
+            left = max(0, int(deadline - time.time()))
+            right += f"   {left // 60}:{left % 60:02d}"
+        self.header(title, right)
+        self.put(3, 3, "▶ ", curses.color_pair(1) | curses.A_BOLD)
+        self.put(3, 5, step.prompt, curses.A_BOLD)
+        if hinted:
+            self.put(5, 5, "keys ", curses.A_DIM)
+            self.draw_caps(5, 10, self.caps_for(step.desc))
+        else:
+            remaining = HINT_DELAY - (time.time() - t0)
+            self.put(5, 5, f"from memory… hint in {max(0, remaining):.0f}s", curses.A_DIM)
+        if step.note:
+            self.put(6, 5, step.note, curses.A_DIM)
+        kind, text = flash
+        if text:
+            attr = {"ok": curses.color_pair(2) | curses.A_BOLD, "bad": curses.color_pair(3) | curses.A_BOLD}
+            self.put(7, 5, text, attr.get(kind, curses.A_DIM))
+        H, W = self.size()
+        self.put(H - 1, 2, "in any tile:  Esc menu · h hint · s skip", curses.A_DIM)
+        self.scr.refresh()
+
+    def finish(self, mode, lesson, run, aborted, title):
+        p = self.progress
+        new_best = False
+        if mode == "lesson" and not aborted:
+            if lesson not in p["lessons"]:
+                p["lessons"].append(lesson)
+        elif mode != "lesson" and run["steps"]:
+            if run["score"] > p["best"].get(mode, 0):
+                p["best"][mode] = run["score"]
+                new_best = True
+            p["history"].append({"t": int(time.time()), "mode": mode, "score": run["score"],
+                                 "steps": run["steps"]})
+            p["history"] = p["history"][-200:]
+        save_progress(p)
+
+        self.place_hud("menu")
+        self.hud_focusable(True)
+        self.write_tiles({"phase": "menu"})
+        self.scr.erase()
+        self.header(title, "done" if not aborted else "stopped")
+        y = 3
+        if mode == "lesson" and not aborted:
+            self.put(y, 3, f"Lesson {lesson} complete. ✓", curses.color_pair(2) | curses.A_BOLD)
+            y += 2
+        elif mode != "lesson":
+            self.put(y, 3, f"Score {run['score']}", curses.A_BOLD)
+            if new_best:
+                self.put(y, 20, "★ new best!", curses.color_pair(4) | curses.A_BOLD)
+            y += 2
+        if run["times"]:
+            avg = sum(run["times"]) / len(run["times"])
+            self.put(y, 3, f"{run['steps']} moves · {run['clean']} from memory · average {avg:.2f}s")
+            y += 2
+            slow = sorted({(d, t) for _, d, t, _ in run["log"]}, key=lambda x: -x[1])[:5]
+            if slow:
+                self.put(y, 3, "Slowest this round:", curses.A_DIM)
+                y += 1
+                for d, t in slow:
+                    self.put(y, 5, f"{t:5.1f}s  {d[:32]:<32}")
+                    self.draw_caps(y, 48, self.caps_for(d))
+                    y += 1
+        self.put(y + 1, 3, "any key to continue", curses.A_DIM)
+        self.scr.refresh()
+        time.sleep(0.6)
+        curses.flushinp()
+        self.scr.timeout(-1)
+        self.scr.getch()
+        self.scr.timeout(500)
+
+    def main(self, start=None):
+        self.setup_hud()
+        self.normalize()
+        if self.hud_addr:
+            self.focus(self.hud_addr)
+        if start:
+            mode, _, n = start.partition(":")
+            if mode == "lesson" and n.isdigit() and int(n) in LESSONS:
+                self.play("lesson", int(n))
+            elif mode in ("drill", "sprint", "all"):
+                self.play(mode)
+        while True:
+            choice = self.menu()
+            if not choice:
+                break
+            mode, lesson = choice
+            self.play(mode, lesson)
+
+
+# ─── Practice tile (runs inside each A/B/C terminal) ──────────────────────
+
+BIG = {
+    "A": [" ███ ", "█   █", "█████", "█   █", "█   █"],
+    "B": ["████ ", "█   █", "████ ", "█   █", "████ "],
+    "C": [" ████", "█    ", "█    ", "█    ", " ████"],
+    "D": ["████ ", "█   █", "█   █", "█   █", "████ "],
+}
+TILE_COLOR = {"A": curses.COLOR_RED, "B": curses.COLOR_GREEN, "C": curses.COLOR_BLUE, "D": curses.COLOR_MAGENTA}
+
+
+def tile_main(scr, letter):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    col = TILE_COLOR.get(letter, curses.COLOR_CYAN)
+    curses.init_pair(1, col, -1)
+    curses.init_pair(2, curses.COLOR_BLACK, col)
+    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    scr.timeout(100)
+    started = time.time()
+
+    def send(cmd):
+        try:
+            fd = os.open(CMD_FIFO, os.O_WRONLY | os.O_NONBLOCK)
+            os.write(fd, (cmd + "\n").encode())
+            os.close(fd)
+        except OSError:
+            pass
+
+    def put(y, x, text, attr=0):
+        H, W = scr.getmaxyx()
+        if 0 <= y < H and 0 <= x < W:
+            try:
+                scr.addnstr(y, x, text, max(0, W - x - 1), attr)
+            except curses.error:
+                pass
+
+    while True:
+        try:
+            with open(TILE_STATE) as f:
+                st = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            st = {}
+        if st.get("phase") == "quit":
+            return
+        hud_pid = st.get("hud_pid")
+        if hud_pid and not os.path.exists(f"/proc/{hud_pid}"):
+            return
+        if not st and time.time() - started > 10:
+            return
+
+        H, W = scr.getmaxyx()
+        target = st.get("phase") == "play" and st.get("target") == letter
+        active = st.get("active") == letter
+        flash = st.get("flash")
+        if target and flash == "ok":
+            bg = curses.color_pair(3)
+        elif target:
+            bg = curses.color_pair(2)
+        else:
+            bg = 0
+        scr.bkgd(" ", bg)
+        scr.erase()
+
+        glyph = BIG.get(letter, [letter])
+        big_attr = (curses.color_pair(1) if not bg else bg) | curses.A_BOLD
+        top = max(0, H // 2 - 5)
+        for i, row in enumerate(glyph):
+            for j, ch in enumerate(row):
+                if ch != " ":
+                    put(top + i, (W - len(row) * 2) // 2 + j * 2, "██", big_attr)
+        y = top + len(glyph) + 1
+        if target:
+            label = "✓ nice" if flash == "ok" else "★  TARGET  ★"
+            put(y, (W - len(label)) // 2, label, bg | curses.A_BOLD)
+        elif active:
+            label = "● focused"
+            put(y, (W - len(label)) // 2, label, curses.color_pair(1) | curses.A_BOLD)
+        if active:
+            for x in range(W - 1):
+                put(0, x, "━", curses.color_pair(1) | curses.A_BOLD)
+                put(H - 1, x, "━", curses.color_pair(1) | curses.A_BOLD)
+        if st.get("phase") == "play" and H > 14:
+            prompt = st.get("prompt", "")
+            put(H - 4, max(1, (W - len(prompt)) // 2), prompt, curses.A_BOLD | bg)
+            keys = st.get("keys")
+            if keys:
+                put(H - 3, max(1, (W - len(keys)) // 2), keys, curses.A_DIM | bg)
+        elif st.get("phase") == "menu" and H > 10:
+            msg = "pick a lesson in the tutor panel"
+            put(H - 3, max(1, (W - len(msg)) // 2), msg, curses.A_DIM)
+        scr.refresh()
+
+        ch = scr.getch()
+        if ch == 27:
+            send("menu")
+        elif ch in (ord("s"), ord("S")):
+            send("skip")
+        elif ch in (ord("h"), ord("H")):
+            send("hint")
+
+
+# ─── Entry points ──────────────────────────────────────────────────────────
+
+def launch(start=None):
+    h = Hypr()
+    clients = h.query("clients") or []
+    hud = next((c for c in clients if c.get("title") == HUD_TITLE), None)
+    if hud:
+        h.dispatch(f'hl.dsp.focus({{ window = "address:{hud["address"]}" }})')
+        print("Omatutor is already running — focused it.")
+        return
+    origin = (h.query("activeworkspace") or {}).get("id", 1)
+    used = {c["workspace"]["id"] for c in clients}
+    practice = next((n for n in (7, 8, 9, 6, 5, 4, 3, 2) if n not in used and n != origin), 9)
+    cmd = terminal_cmd(HUD_TITLE, [sys.executable, SCRIPT, "--hud",
+                                   "--practice", str(practice), "--origin", str(origin)]
+                       + (["--start", start] if start else []))
+    h.dispatch(f'hl.dsp.focus({{ workspace = "{practice}" }})')
+    h.dispatch(f"hl.dsp.exec_cmd({lua_str(cmd)}, {{ workspace = \"{practice}\" }})")
+    print(f"Omatutor started on workspace {practice}. It returns you to workspace {origin} when you quit.")
+
+
+def hud(argv):
+    practice = int(argv[argv.index("--practice") + 1])
+    origin = int(argv[argv.index("--origin") + 1])
+    start = argv[argv.index("--start") + 1] if "--start" in argv else None
+    holder = {}
+
+    def bail(*_):
+        g = holder.get("g")
+        if g:
+            g.cleanup()
+        os._exit(0)
+
+    signal.signal(signal.SIGHUP, bail)
+    signal.signal(signal.SIGTERM, bail)
+
+    def run(scr):
+        g = Game(scr, practice, origin)
+        holder["g"] = g
+        try:
+            g.main(start)
+        finally:
+            save_progress(g.progress)
+            g.cleanup()
+
+    curses.wrapper(run)
+
+
+def main():
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    argv = sys.argv[1:]
+    if "--tile" in argv:
+        letter = argv[argv.index("--tile") + 1]
+        curses.wrapper(tile_main, letter)
+    elif "--hud" in argv:
+        hud(argv)
+    elif "--reset" in argv:
+        if os.path.exists(PROGRESS_FILE):
+            os.unlink(PROGRESS_FILE)
+        print("Progress reset.")
+    elif argv and argv[0] in ("-h", "--help"):
+        print(__doc__)
+    elif argv and argv[0] in ("drill", "sprint", "all"):
+        launch(argv[0])
+    elif argv and argv[0] == "lesson" and len(argv) > 1:
+        launch(f"lesson:{argv[1]}")
+    else:
+        launch()
+
+
+if __name__ == "__main__":
+    main()
