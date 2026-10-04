@@ -19,6 +19,7 @@ import json
 import locale
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -42,6 +43,8 @@ OLD_STATE_DIR = os.path.join(os.path.dirname(STATE_DIR), "omarchy-tutor")
 TILE_STATE = os.path.join(RUNTIME, "tiles.json")
 CMD_FIFO = os.path.join(RUNTIME, "cmd")
 LAYOUTS_DIR = os.path.expanduser("~/.local/state/omarchy/workspace-layouts")
+THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
+ACCENT_SLOT = 254         # palette index we redefine to the theme's accent (own window only)
 
 LETTERS = "ABCD"
 HINT_DELAY = 4.0          # seconds before the key hint appears in drills
@@ -152,6 +155,39 @@ def load_keys() -> dict:
         seen.add(desc)
         keys[desc] = combo
     return keys
+
+
+def theme_accent() -> Optional[tuple]:
+    """The active Omarchy theme's accent colour as (r, g, b), or None."""
+    try:
+        with open(THEME_COLORS) as f:
+            for line in f:
+                m = re.match(r'\s*accent\s*=\s*"#([0-9a-fA-F]{6})"', line)
+                if m:
+                    h = m.group(1)
+                    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except OSError:
+        pass
+    return None
+
+
+def nearest_xterm256(r, g, b) -> int:
+    """Closest entry in the xterm 256-colour cube/ramp, for terminals whose palette
+    can't be changed."""
+    steps = [0, 95, 135, 175, 215, 255]
+    best, best_d = 7, None
+    for i, cr in enumerate(steps):
+        for j, cg in enumerate(steps):
+            for k, cb in enumerate(steps):
+                d = (cr - r) ** 2 + (cg - g) ** 2 + (cb - b) ** 2
+                if best_d is None or d < best_d:
+                    best, best_d = 16 + 36 * i + 6 * j + k, d
+    for n in range(24):
+        v = 8 + 10 * n
+        d = 3 * (v - r) ** 2 if r == g == b else (v - r) ** 2 + (v - g) ** 2 + (v - b) ** 2
+        if d < best_d:
+            best, best_d = 232 + n, d
+    return best
 
 
 def key_caps(combo: str) -> list:
@@ -1159,6 +1195,26 @@ class Game:
             curses.init_pair(i, c, -1)
         curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_YELLOW)
         curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        # The panel's frame and badge follow the Omarchy theme's accent colour. ANSI
+        # cyan is the fallback when there's no theme file or only 16 colours.
+        self.accent_pair, self.badge_pair = 1, 8
+        acc = theme_accent()
+        if acc and curses.COLORS >= 256:
+            idx = None
+            if curses.can_change_color():
+                try:
+                    curses.init_color(ACCENT_SLOT, *(v * 1000 // 255 for v in acc))
+                    idx = ACCENT_SLOT
+                except curses.error:
+                    idx = None
+            if idx is None:
+                idx = nearest_xterm256(*acc)
+            try:
+                curses.init_pair(9, idx, -1)
+                curses.init_pair(10, curses.COLOR_BLACK, idx)
+                self.accent_pair, self.badge_pair = 9, 10
+            except curses.error:
+                pass
 
     def size(self):
         """Usable rows/cols inside the panel's frame."""
@@ -1177,7 +1233,7 @@ class Game:
     def frame(self):
         """A solid accent-coloured frame so the floating panel reads as a panel on any
         theme, including light ones where Hyprland's inactive border all but vanishes."""
-        attr = curses.color_pair(1) | curses.A_BOLD
+        attr = curses.color_pair(self.accent_pair) | curses.A_BOLD
         try:
             self.scr.attron(attr)
             self.scr.box()
@@ -1201,7 +1257,7 @@ class Game:
     def header(self, title, right="", rule=True):
         self.frame()
         H, W = self.size()
-        self.put(0, 1, " OMATUTOR ", curses.color_pair(8) | curses.A_BOLD)
+        self.put(0, 1, " OMATUTOR ", curses.color_pair(self.badge_pair) | curses.A_BOLD)
         self.put(0, 12, title, curses.color_pair(1) | curses.A_BOLD)
         if right:
             self.put(0, max(13 + len(title), W - len(right) - 2), right, curses.A_BOLD)
