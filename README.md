@@ -2,9 +2,9 @@
 
 A vimtutor-style game for building muscle memory with Omarchy's keybindings.
 
-It runs inside your real Hyprland session, not a simulation. A small pinned panel gives you an instruction ("Move focus LEFT ←"), you press the real keys, and Omatutor watches Hyprland's state over its IPC socket to see whether you did it. The practice windows are big lettered tiles (A, B, C) on a spare workspace. The tile you need lights up.
+It runs inside your real Hyprland session, not a simulation. A thin panel along the bottom of the screen gives you an instruction ("Move focus LEFT ←"), you press the real keys, and Omatutor watches Hyprland's state over its IPC socket to see whether you did it. The practice windows are big lettered tiles (A, B, C) on a spare workspace. The tile you need lights up.
 
-![Lesson 1 asks you to move focus left; tile A is lit as the target and the panel shows the keys](screenshots/play-hinted.png)
+![Lesson 1 asks you to move focus left; tile A is lit as the target and the panel below the tiles shows the keys](screenshots/play-hinted.png)
 
 ## Install and run
 

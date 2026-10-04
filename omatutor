@@ -14,6 +14,7 @@ tiles (A, B, C...) on a spare workspace, and everything is cleaned up on exit.
 """
 
 import curses
+import fcntl
 import json
 import locale
 import os
@@ -21,8 +22,10 @@ import random
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
+import termios
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -45,6 +48,8 @@ HINT_DELAY = 4.0          # seconds before the key hint appears in drills
 DRILL_SECONDS = 300
 SPRINT_SECONDS = 60
 SETTLE = 0.12             # pause after our own dispatches
+PLAY_ROWS = 5             # play strip height in terminal rows: frame + 3 lines + frame
+PLAY_MARGIN = 10          # logical px between the play strip and the screen edge / tiles
 
 
 # ─── Hyprland IPC ──────────────────────────────────────────────────────────
@@ -862,6 +867,9 @@ class Game:
         self.progress = load_progress()
         self.snap = Snap(self.h, practice)
         self.hud_addr = None
+        self.rows = 0
+        self.row_px = 16.0          # terminal cell height in logical px; refined once the HUD is up
+        self.play_h = 0
         self.focusable = True
         self.tiles_state = {}
         self.layout_file = os.path.join(LAYOUTS_DIR, f"{practice}.lua")
@@ -924,14 +932,24 @@ class Game:
         scale = m.get("scale", 1) or 1
         mw, mh = int(m.get("width", 1920) / scale), int(m.get("height", 1080) / scale)
         mx, my = m.get("x", 0), m.get("y", 0)
+        hud = self.snap.hud
+        a = self.hud_addr
+        if hud and self.rows and hud.h / self.rows > 4:
+            # Learn the terminal's cell height (window sizes are in logical px) so the
+            # play strip can be exactly as tall as its text needs.
+            self.row_px = hud.h / self.rows
         if mode == "menu":
             w, h = min(760, mw - 40), min(500, mh - 80)
             x, y = mx + (mw - w) // 2, my + (mh - h) // 2
         else:
-            w, h = min(820, mw - 40), 230
-            x, y = mx + (mw - w) // 2, my + mh - h - 18
-        hud = self.snap.hud
-        a = self.hud_addr
+            w = mw - 2 * PLAY_MARGIN
+            tm = self.term_metrics()
+            if tm:
+                _, cell, pad = tm
+                h = int(pad + PLAY_ROWS * cell + 2)
+            else:
+                h = int(PLAY_ROWS * self.row_px + 4)
+            x, y = mx + PLAY_MARGIN, my + mh - h - PLAY_MARGIN
         if hud and not hud.floating:
             self.win_dispatch("float", a, 'action = "enable"')
         self.win_dispatch("resize", a, f"x = {w}, y = {h}")
@@ -942,12 +960,47 @@ class Game:
         self.dispatch(f'hl.dsp.window.alter_zorder({{ window = "address:{a}", mode = "top" }})')
         self.settle()
         self.sync_size()
+        if mode == "play":
+            # Terminals add their own padding and the window may land a row off, so
+            # nudge the strip until it has exactly PLAY_ROWS rows.
+            for _ in range(4):
+                tm = self.term_metrics()
+                cell = tm[1] if tm else self.row_px
+                if self.rows < PLAY_ROWS:
+                    h += int((PLAY_ROWS - self.rows) * cell) + 2
+                elif self.rows > PLAY_ROWS and tm:
+                    h -= int((self.rows - PLAY_ROWS) * cell) - 1
+                else:
+                    break
+                y = my + mh - h - PLAY_MARGIN
+                self.win_dispatch("resize", a, f"x = {w}, y = {h}")
+                self.win_dispatch("move", a, f"x = {x}, y = {y}")
+                self.settle()
+                self.sync_size()
+            self.play_h = h
+
+    def term_metrics(self):
+        """(rows, cell height, padding) in logical px, from the terminal's own pixel
+        report (TIOCGWINSZ). None if the terminal doesn't fill in pixel sizes."""
+        try:
+            rows, _, _, ypix = struct.unpack("HHHH", fcntl.ioctl(sys.__stdout__.fileno(),
+                                                               termios.TIOCGWINSZ, b"\0" * 8))
+        except (OSError, ValueError):
+            return None
+        hud = self.poll().hud
+        if not rows or not ypix or not hud:
+            return None
+        scale = self.snap.monitor.get("scale", 1) or 1
+        cell = ypix / rows / scale
+        pad = max(0.0, hud.h - ypix / scale)   # window chrome plus any partial row
+        return rows, cell, pad
 
     def sync_size(self):
         """Pick up the HUD's new terminal size right away instead of on the next getch."""
         for _ in range(10):
             try:
                 cols, rows = os.get_terminal_size(sys.__stdout__.fileno())
+                self.rows = rows
             except OSError:
                 return
             if curses.is_term_resized(rows, cols):
@@ -1036,6 +1089,25 @@ class Game:
     def set_layout(self, layout):
         self.h.eval(f'hl.workspace_rule({{ workspace = "{self.practice}", layout = "{layout}" }})')
 
+    def reserve_bottom(self, px: int):
+        """Keep the practice workspace's tiles above the play strip by giving the
+        workspace a bottom outer gap. The other three sides keep the user's gaps_out."""
+        gaps = [0, 0, 0, 0]
+        try:
+            out = subprocess.run(["hyprctl", "getoption", "general:gaps_out"], capture_output=True, text=True).stdout
+            nums = [int(float(v)) for v in out.split(":", 1)[1].split("\n")[0].split()][:4]
+            if len(nums) == 4:
+                gaps = nums
+        except (IndexError, ValueError, OSError):
+            pass
+        top, right, _, left = gaps
+        self.release_bottom()
+        self.h.eval(f'omatutor_gap = hl.workspace_rule({{ workspace = "{self.practice}", '
+                    f'gaps_out = {{ top = {top}, right = {right}, bottom = {px}, left = {left} }} }})')
+
+    def release_bottom(self):
+        self.h.eval("if omatutor_gap then omatutor_gap:set_enabled(false); omatutor_gap = nil end")
+
     def cleanup(self):
         try:
             s = self.poll()
@@ -1047,6 +1119,7 @@ class Game:
                 self.win_dispatch("close", w.addr)
             if s.layout(self.practice) != "dwindle":
                 self.set_layout("dwindle")
+            self.release_bottom()
             if self.layout_backup is None:
                 if os.path.exists(self.layout_file):
                     os.unlink(self.layout_file)
@@ -1125,14 +1198,15 @@ class Game:
         combo = self.keys.get(desc)
         return key_caps(combo) if combo else ["?"]
 
-    def header(self, title, right=""):
+    def header(self, title, right="", rule=True):
         self.frame()
         H, W = self.size()
         self.put(0, 1, " OMATUTOR ", curses.color_pair(8) | curses.A_BOLD)
         self.put(0, 12, title, curses.color_pair(1) | curses.A_BOLD)
         if right:
             self.put(0, max(13 + len(title), W - len(right) - 2), right, curses.A_BOLD)
-        self.put(1, 1, "─" * (W - 3), curses.A_DIM)
+        if rule:
+            self.put(1, 1, "─" * (W - 3), curses.A_DIM)
 
     # ── menus ──
     def menu(self) -> Optional[tuple]:
@@ -1262,6 +1336,7 @@ class Game:
         self.scr.refresh()
         self.place_hud("play")
         self.hud_focusable(False)
+        self.reserve_bottom(self.play_h + 2 * PLAY_MARGIN)
         self.normalize()
         self.read_cmds()  # drop stray Esc presses from the menu
 
@@ -1322,6 +1397,7 @@ class Game:
                     break
             if aborted:
                 break
+        self.release_bottom()
         self.normalize()
         self.finish(mode, lesson, run, aborted, title)
 
@@ -1420,23 +1496,27 @@ class Game:
         if deadline:
             left = max(0, int(deadline - time.time()))
             right += f"   {left // 60}:{left % 60:02d}"
-        self.header(title, right)
-        self.put(3, 3, "▶ ", curses.color_pair(1) | curses.A_BOLD)
-        self.put(3, 5, step.prompt, curses.A_BOLD)
+        # Three lines: title/score, prompt + keys, status/footer. The strip is sized
+        # to exactly this in place_hud, so nothing of the tiles is covered.
+        self.header(title, right, rule=False)
+        H, W = self.size()
+        self.put(1, 1, "▶ ", curses.color_pair(1) | curses.A_BOLD)
+        self.put(1, 3, step.prompt, curses.A_BOLD)
+        x = 3 + len(step.prompt) + 4
         if hinted:
-            self.put(5, 5, "keys ", curses.A_DIM)
-            self.draw_caps(5, 10, self.caps_for(step.desc))
+            self.put(1, x, "keys ", curses.A_DIM)
+            self.draw_caps(1, x + 5, self.caps_for(step.desc))
         else:
             remaining = HINT_DELAY - (time.time() - t0)
-            self.put(5, 5, f"from memory… hint in {max(0, remaining):.0f}s", curses.A_DIM)
-        if step.note:
-            self.put(6, 5, step.note, curses.A_DIM)
+            self.put(1, x, f"from memory… hint in {max(0, remaining):.0f}s", curses.A_DIM)
         kind, text = flash
         if text:
             attr = {"ok": curses.color_pair(2) | curses.A_BOLD, "bad": curses.color_pair(3) | curses.A_BOLD}
-            self.put(7, 5, text, attr.get(kind, curses.A_DIM))
-        H, W = self.size()
-        self.put(H - 1, 2, "in any tile:  Esc menu · h hint · s skip", curses.A_DIM)
+            self.put(2, 3, text, attr.get(kind, curses.A_DIM))
+        elif step.note:
+            self.put(2, 3, step.note, curses.A_DIM)
+        footer = "in any tile:  Esc menu · h hint · s skip"
+        self.put(2, max(3, W - len(footer) - 2), footer, curses.A_DIM)
         self.scr.refresh()
 
     def finish(self, mode, lesson, run, aborted, title):
