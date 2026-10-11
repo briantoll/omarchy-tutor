@@ -24,6 +24,12 @@ omatutor --reset       # forget progress
 
 It needs nothing beyond Python 3 and a terminal Omarchy already ships (foot, alacritty, kitty or ghostty). Omatutor picks an empty workspace (7 if it's free), and when you quit it closes its tiles and takes you back to where you started.
 
+To put it in the Omarchy menu (Super + Alt + Space) under Learn, next to Keybindings, add this line to `~/.config/omarchy/extensions/omarchy-menu.jsonc`. The menu picks it up without a restart.
+
+```jsonc
+"learn.practice": {"icon":"󰌌","label":"Practice keys","action":"omatutor"},
+```
+
 ![The menu: seven lessons, two timed drills, and your slowest keys](screenshots/menu.png)
 
 ## Lessons
